@@ -80,6 +80,8 @@ S_attn(x) = { head h : ||output(h, x)|| > τ }
 
 The logic is identical in both cases: if a component's contribution to the output is near zero for this input, it is not copied into the shadow. A head with a near-zero output norm contributed nothing to the response regardless of its internal attention weights, and can be safely excluded.
 
+**On residual stream consistency.** Transformer attention heads write their outputs into a shared residual stream of fixed dimension. When a head is excluded from the shadow, its contribution to that stream is zero — which is identical to its contribution in the full model for inputs where it was inactive. The residual stream state in the shadow is therefore consistent with the full model for those inputs. The remaining open question — whether heads that are inactive for a given user's typical requests introduce measurable distribution shift when permanently absent rather than occasionally inactive — is quantified in the proposed experiment in Section 6.
+
 The full activated subgraph is therefore:
 
 ```
@@ -191,6 +193,41 @@ High entropy                    → full model directly
 
 This two-signal approach makes the shadow model self-aware of the boundaries of its own knowledge without any external component.
 
+### 3.8 Shadow Staleness Management
+
+When the base model is updated, the shadow's copied weights may become inconsistent with the new version. The system handles this through a layer-level hashing strategy analogous to version control in software:
+
+At shadow construction time, a hash is computed for each layer of the base model and stored alongside the shadow:
+
+```
+Shadow metadata:
+  {
+    layer_1_hash:  a3f9b2c1,
+    layer_2_hash:  b7d4e9f2,
+    layer_3_hash:  c2a1f8b3,
+    ...
+    full_model_hash: x9f2a1b4  ← cheap summary hash of entire model
+  }
+```
+
+At the start of each session, only the full model hash is recomputed and compared. This is fast regardless of model size since it operates on a summary:
+
+```
+full_model_hash unchanged → shadow is valid, proceed normally
+full_model_hash changed   → run per-layer diff
+```
+
+The per-layer diff identifies exactly which layers changed:
+
+```
+layer_1: a3f9b2c1 == a3f9b2c1  ✅ unchanged, shadow weights still valid
+layer_2: b7d4e9f2 == b7d4e9f2  ✅ unchanged
+layer_3: c2a1f8b3 != d7e2a9f4  ❌ changed, update shadow weights for this layer
+layer_4: f1b3c9a2 != e4d8b1c7  ❌ changed, update shadow weights for this layer
+```
+
+Only the shadow neurons belonging to changed layers need to be refreshed. Neurons in unchanged layers remain valid and the user's accumulated profile is preserved. This surgical update avoids discarding the entire shadow on every model update, which would eliminate the personalization benefit entirely.
+
 ---
 
 ## 4. Key Properties
@@ -211,6 +248,8 @@ This two-signal approach makes the shadow model self-aware of the boundaries of 
 
 **Self-aware coverage.** The shadow model detects the boundaries of its own knowledge through output entropy, routing requests to the full model only when genuinely needed. No external classifier or routing component is required.
 
+**Self-managing versioning.** The shadow model detects base model updates automatically through layer-level hashing and refreshes only the affected layers, preserving the user's accumulated profile across model updates.
+
 ---
 
 ## 5. Differences from Prior Work
@@ -227,7 +266,33 @@ This two-signal approach makes the shadow model self-aware of the boundaries of 
 
 ---
 
-## 6. Conclusion
+## 6. Open Challenges and Future Work
+
+**Per-layer threshold refinement.** The adaptive threshold mechanism described in Section 3.4 operates globally across the model. However, different layers may have very different activation distributions, meaning a single τ may be too aggressive for some layers and too permissive for others. Extending the adaptive mechanism to learn a separate threshold per layer is a natural improvement that could reduce shadow model size further without additional quality loss.
+
+**Residual stream distribution shift.** As discussed in Section 3.3, omitting heads with near-zero output norm does not introduce errors for the specific inputs where those heads were inactive. However, a subtler issue remains: downstream layers were trained on a statistical distribution where those heads contribute *sometimes*, even if rarely. The shadow model presents those heads as permanently absent rather than occasionally inactive, which constitutes a small but systematic shift from the training distribution. For users with highly repetitive request patterns — the primary target of this system — those heads are likely to remain inactive on future requests as well, making this error practically negligible. However, the precise magnitude of this effect has not been empirically measured.
+
+**Proposed experiment.** To quantify this effect we propose the following validation:
+
+```
+1. Select a base model with known architecture (e.g. LLaMA 3.2 3B)
+2. Define a target user profile (e.g. Python developer)
+3. Simulate N requests drawn from that profile
+4. Construct the shadow model from those requests
+5. Evaluate on:
+   a. Seen inputs: KL divergence between shadow and full model outputs
+   b. Similar unseen inputs: KL divergence on held-out requests
+      from the same profile
+   c. Dissimilar inputs: confirm fallback triggers correctly
+6. Measure shadow model size as a fraction of full model size
+7. Repeat across multiple user profiles and model sizes
+```
+
+This experiment would directly quantify whether the residual stream distribution shift introduces measurable degradation in practice, and establish the compression ratio achievable for different user profiles.
+
+---
+
+## 7. Conclusion
 
 We have described a system for constructing personalized shadow models of large language models through incremental accumulation of user-specific activation subgraphs. The shadow model is not a sparse approximation of the original — it is a small, dense, standalone model containing exactly the neurons and weights that a specific user actually needs.
 
