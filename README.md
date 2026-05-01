@@ -119,23 +119,32 @@ The routing problem then has two levels:
 
 ### 3.4 Shadow-Assisted Inference
 
-At inference time, the system decides whether a shadow model is likely to be reliable for the current request. This routing decision can combine several signals:
-
-1. **Output entropy** from the shadow model.
-2. **Similarity** between the new request and the user's historical request embeddings.
-3. **Calibration history** for similar prompts.
-4. **Recent fallback rate** and observed divergence.
-
-A simple routing rule could be:
+At inference time, the system decides whether a shadow model is likely to be reliable for the current request. Rather than treating each routing signal as an independent hard threshold, the system computes a composite routing confidence that aggregates multiple complementary signals:
 
 ```
-if entropy < H_max and similarity > S_min and calibration_status == valid:
-    use shadow model
-else:
-    use full model and update profile
+c(x) = w_e · f_entropy(H_shadow(x))
+     + w_s · f_similarity(x, P_user)
+     + w_f · f_fallback(recent_history)
+     + w_c · calibration_confidence(shadow)
 ```
 
-Entropy alone is not sufficient because models can be confidently wrong. Similarity and calibration history reduce this risk, but they do not provide a formal correctness guarantee. The intended guarantee is operational rather than absolute: uncertain or out-of-profile requests are routed to the full model, while in-profile requests are answered by a shadow model that has been empirically validated on similar inputs.
+Where:
+
+- `f_entropy` maps the shadow model's output entropy to a confidence term. Lower entropy implies higher confidence, but entropy alone is insufficient because models can be confidently wrong.
+- `f_similarity` measures the proximity of the incoming request to the user's validated distribution, using the same embedding space used during profile construction.
+- `f_fallback` reflects the shadow's recent routing success rate over a sliding window of interactions.
+- `calibration_confidence` encodes how well the shadow performed during its most recent closed-loop calibration round (Section 4.5).
+
+The routing decision is then:
+
+```
+route(x) = shadow   if c(x) >= c_min  and  shadow_status == validated
+           full     otherwise
+```
+
+The weights `w_e, w_s, w_f, w_c` and the minimum confidence threshold `c_min` are not set manually. They are determined during the same closed-loop calibration procedure used to select component thresholds (Section 4.4), by optimizing for low false-accept rate on the activity-specific validation set.
+
+This formulation does not provide a formal correctness guarantee. The intended guarantee is operational rather than absolute: uncertain or out-of-profile requests are routed to the full model, while in-profile requests are answered by a shadow model that has been empirically validated on similar inputs. The specific functional forms and weight calibration strategy are subject to experimental validation.
 
 ---
 
@@ -143,27 +152,34 @@ Entropy alone is not sufficient because models can be confidently wrong. Similar
 
 ## 4. Shadow Construction and Calibration
 
-### 4.1 User-Specific Activation Profiling
+### 4.1 Activation Recording and User Profile Construction
 
-For each request processed by the full model, activation hooks record structured component statistics across layers. The relevant signal is not the raw internal activation of a component, but the contribution that component writes into the residual stream after its output projection.
+The activation profiling pipeline has two stages: per-request recording and profile aggregation.
 
-For MLP blocks, the system records channel-level contribution after the channel has passed through the MLP output projection:
+**Stage 1: Per-request recording.** For each user request processed by the full model, activation hooks record the post-output contribution of every structured component to the residual stream. This is not the raw internal activation of a component, but the vector it actually writes into the residual stream after its output projection.
 
-```
-I_mlp(l, c) = E_x [ ||residual_contribution_mlp(l, c, x)||_2 ]
-```
-
-where `l` is the layer index, `c` is the MLP channel index, and the expectation is estimated over the user's observed requests.
-
-For attention blocks, the system records each attention head's post-output-projection contribution to the residual stream:
+For each MLP channel `c` in layer `l`, the system records:
 
 ```
-I_attn(l, h) = E_x [ ||residual_contribution_attn(l, h, x)||_2 ]
+r_mlp(l, c, x) = ||residual_contribution_mlp(l, c, x)||_2
 ```
 
-where `h` is the attention-head index.
+For each attention head `h` in layer `l`:
 
-The user profile is therefore represented as a set of running post-output importance estimates:
+```
+r_attn(l, h, x) = ||residual_contribution_attn(l, h, x)||_2
+```
+
+The system records these per-component scalars for each request. It does not copy or store the activation vectors themselves; it only retains the contribution magnitudes needed to update the user profile.
+
+**Stage 2: Profile aggregation.** The per-request contributions are accumulated into a running user profile using exponential moving averages or simple running means:
+
+```
+I_mlp(l, c)  ← α · r_mlp(l, c, x)  + (1 - α) · I_mlp(l, c)
+I_attn(l, h) ← α · r_attn(l, h, x) + (1 - α) · I_attn(l, h)
+```
+
+The user profile is therefore a set of running post-output importance estimates and usage statistics:
 
 ```
 P_user = {
@@ -176,18 +192,29 @@ P_user = {
 }
 ```
 
-A component is considered a candidate for inclusion when its estimated post-output importance exceeds a learned threshold:
+**Component selection.** A component is retained in the candidate shadow when its aggregated post-output importance exceeds a layer-specific threshold:
 
 ```
 S_user = { component k : I_user(k) >= τ_layer(k) }
 ```
 
-Layer-specific thresholds are preferable to a single global threshold because contribution distributions can vary substantially across layers.
+Layer-specific thresholds are preferable to a single global threshold because contribution distributions can vary substantially across layers. Threshold values are determined through the closed-loop calibration procedure described in Section 4.4.
+
+**The full selected subnetwork** for a user is therefore:
+
+```
+S_user = S_mlp ∪ S_attn
+       + all weight slices connecting retained components
+```
+
+This selection is a standard operation supported natively by frameworks such as PyTorch and does not require any modification to the model architecture or special hardware.
+
+**On residual stream consistency.** Transformer components write their outputs into a shared residual stream of fixed dimension. When a component is excluded from the shadow, its contribution to that stream is zero — which is identical to its contribution in the full model for inputs where it was inactive. The residual stream state in the shadow is therefore consistent with the full model for those inputs. The remaining open question — whether components that are inactive for a given user's typical requests introduce measurable distribution shift when permanently absent rather than occasionally inactive — is quantified in the proposed experiment in Section 7.
 
 
-### 4.2 Post-Output Component Attribution
+### 4.2 Post-Output Attribution: What Is Measured and What Is Retained
 
-The post-output contribution is an attribution signal, not a cached activation. The system does not copy the activation vectors observed for specific prompts. Instead, those vectors are used to decide which parameterized components should be retained in the shadow model.
+The post-output contribution is an attribution signal, not a cached activation. The system does not copy the activation vectors observed for specific prompts. Instead, those contribution magnitudes are used to decide which parameterized components should be retained in the shadow model.
 
 For attention heads, attribution is measured after the head's output has been mapped through its corresponding output-projection slice and written into the residual stream. If a head is retained, the shadow retains the parameter slices needed to compute that head on future inputs, including the relevant query, key, value, and output-projection parameters.
 
@@ -196,38 +223,8 @@ For MLP channels, attribution is measured after the channel contributes through 
 Under this definition, component removal means forcing that component's residual-stream write to zero in the candidate shadow. This makes attention-head removal, MLP-channel removal, and residual-coordinate compaction part of the same principle: select components according to their actual post-output effect on the residual stream, then validate the resulting candidate shadow against the full model.
 
 
-### 4.3 Activation Recording
 
-For each user request processed by the full model, we perform a standard forward pass with activation hooks attached to all layers. The same threshold mechanism applies uniformly to both types of components in a transformer:
-
-For feedforward neurons, we record every neuron whose activation magnitude exceeds threshold τ:
-
-```
-S_ff(x) = { neuron n : |activation(n, x)| > τ }
-```
-
-For attention heads, we record every head whose output vector norm exceeds the same threshold τ:
-
-```
-S_attn(x) = { head h : ||output(h, x)|| > τ }
-```
-
-The logic is identical in both cases: if a component's contribution to the output is near zero for this input, it is not copied into the shadow. A head with a near-zero output norm contributed nothing to the response regardless of its internal attention weights, and can be safely excluded.
-
-**On residual stream consistency.** Transformer attention heads write their outputs into a shared residual stream of fixed dimension. When a head is excluded from the shadow, its contribution to that stream is zero — which is identical to its contribution in the full model for inputs where it was inactive. The residual stream state in the shadow is therefore consistent with the full model for those inputs. The remaining open question — whether heads that are inactive for a given user's typical requests introduce measurable distribution shift when permanently absent rather than occasionally inactive — is quantified in the proposed experiment in Section 6.
-
-The full activated subgraph is therefore:
-
-```
-S(x) = S_ff(x) ∪ S_attn(x)
-      + all weights connecting components in S(x)
-```
-
-This is a standard operation supported natively by frameworks such as PyTorch and does not require any modification to the model or special hardware.
-
-
-
-### 4.4 Zero-Imputed Normalization for Residual Compaction
+### 4.3 Zero-Imputed Normalization for Residual Compaction
 
 When residual coordinates are removed, the shadow model should not necessarily normalize over the reduced width as if it were a newly trained smaller transformer. Instead, the proposed compact shadow treats omitted residual coordinates as **implicit zeros**. The model only materializes the retained coordinates, but normalization is computed with respect to the original hidden width.
 
@@ -252,7 +249,7 @@ LayerNorm with bias terms may require additional care, because omitted coordinat
 Under this interpretation, residual-width compaction is not a newly trained smaller geometry. It is a compact implementation of a masked full-width model in which removed residual coordinates are zero by construction.
 
 
-### 4.5 Adaptive Threshold Learning
+### 4.4 Adaptive Threshold Learning
 
 Rather than choosing thresholds manually, the system treats threshold selection as an optimization problem. The objective is to minimize the shadow model's size while keeping its behavior close to the full model on the user's distribution.
 
@@ -276,7 +273,7 @@ subject to   E_x[D(P_full(. | x), P_shadow(. | x))] <= ε
 This framing makes the shadow model an empirically validated approximation rather than an assumed exact copy of the full model.
 
 
-### 4.6 Closed-Loop Shadow Calibration
+### 4.5 Closed-Loop Shadow Calibration
 
 After a candidate shadow is constructed, it is not assumed to be valid solely because its components were selected by activation magnitude. During calibration, the same prompts are evaluated by both the full model and the candidate shadow. Their output distributions are compared, and intermediate hidden states may also be compared when measuring residual-stream drift.
 
@@ -285,7 +282,7 @@ If the candidate shadow diverges beyond the allowed tolerance, the selection thr
 This calibration step is primarily part of the experimental and growth phase. Once a shadow has been accepted, it does not need to be recalibrated on every request unless the user's activity profile changes, the shadow begins to fail validation checks, or the base model is updated.
 
 
-### 4.7 Convergence and Staleness Management
+### 4.6 Convergence and Staleness Management
 
 The shadow model should be considered converged only when measurable indicators stabilize. Possible convergence criteria include:
 
@@ -294,6 +291,8 @@ The shadow model should be considered converged only when measurable indicators 
 - the fallback rate falls below a target value;
 - task-level quality metrics remain within an acceptable margin;
 - the selected component set remains stable over a moving window of interactions.
+
+Conversely, components that remain inactive across a sustained period of user interactions could eventually be candidates for removal from the shadow, reducing its size further over time. The specific decay policy, such as how long a component must remain inactive before removal and whether removal is reversible, is a design question that would need to be explored alongside the core validation mechanism.
 
 A shadow model derived from one version of a base model may become stale when the base model changes. The system should store metadata linking each shadow model to the exact base model artifact used to construct it.
 
@@ -354,7 +353,7 @@ Layer-level hashes can help determine which parts of a shadow model might remain
 ## 6. Differences from Prior Work
 
 | Property | Static pruning | Distillation | MoE | Adapters / fine-tuning | This proposal |
-|---|---:|---:|---:|---:|---:|
+|---|---|---|---|---|---|
 | Personalized per user | Usually no | Usually no | No | Yes | Yes |
 | Dynamic from real user behavior | Usually no | Usually no | No | Sometimes | Yes |
 | Uses internal activations as primary signal | Sometimes | No | Router-dependent | No | Yes |
